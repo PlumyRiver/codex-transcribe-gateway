@@ -1,0 +1,20 @@
+Codex Transcribe Gateway
+Copyright (c) 2026 PlumyRiver and contributors.
+
+This project extracts transcription and OAuth integration behavior from a
+Sub2API-based deployment. It is not an official OpenAI product.
+
+Sub2API: https://github.com/Wei-Shaw/sub2api
+Pinned source: 2f3fed2fdb0787141294cec81487a5df30426f7f (v0.2.10)
+License: LGPL-3.0-or-later. Original notices remain in the upstream source.
+
+patches/sub2api-transcription.patch contains the transcription additions to
+that pinned source. It excludes unrelated Live, image, account-routing,
+billing, customer records, credentials and production deployment settings.
+The standalone JavaScript service is a separate implementation of the
+transcription route and authorization lifecycle; it is also distributed
+under LGPL-3.0-or-later. LICENSE and LICENSES/GPL-3.0.txt contain the terms.
+
+Dependencies retain their own licenses; see package-lock.json and the
+installed packages. OpenAI, ChatGPT and Codex are trademarks of their
+respective owners. Account eligibility is determined by the upstream service.

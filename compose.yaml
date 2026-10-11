@@ -1,0 +1,35 @@
+services:
+  gateway:
+    build: .
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - credentials:/data
+    restart: unless-stopped
+    stop_grace_period: 20s
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+  login:
+    build: .
+    profiles: ["tools"]
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      OAUTH_BIND_HOST: 0.0.0.0
+    command: ["node", "src/login.mjs"]
+    ports:
+      - "127.0.0.1:1455:1455"
+    volumes:
+      - credentials:/data
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+volumes:
+  credentials:

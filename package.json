@@ -1,0 +1,23 @@
+{
+  "name": "codex-transcribe-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted OAuth audio transcription gateway extracted from a Sub2API integration",
+  "license": "LGPL-3.0-or-later",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "init": "node scripts/init.mjs",
+    "login": "node --env-file=.env src/login.mjs",
+    "start": "node --env-file=.env src/main.mjs",
+    "test": "node --test --test-timeout=20000 test/*.test.mjs",
+    "smoke": "node --env-file=.env scripts/transcribe.mjs",
+    "scan": "node scripts/scan-public.mjs"
+  },
+  "dependencies": {
+    "jose": "6.2.12",
+    "proper-lockfile": "4.1.2"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "at": "2026-10-11T19:51:36.183Z",
+  "status": 200,
+  "elapsedMs": 1781,
+  "authentication": "Existing authorized OAuth access token, read-only; no refresh token copied or refreshed",
+  "audio": {
+    "kind": "known synthetic English speech",
+    "sha256": "5ece063797be6b82ee3d3e03ec0f78450f102697e6f01f2309bda53e66478156",
+    "bytes": 160218
+  },
+  "requestedModel": "gpt-transcribe",
+  "reportedModel": null,
+  "modelVerification": "unreported",
+  "transcriptMatch": true,
+  "transcript": "The number is forty seven. Today is a sunny day. We are testing voice transcription.",
+  "upstreamErrorCode": null,
+  "attempts": 1,
+  "apiKeyFallbackUsed": false,
+  "freshBrowserAuthorizationTested": false
+}

@@ -1,0 +1,666 @@
+diff --git a/backend/internal/handler/openai_transcribe.go b/backend/internal/handler/openai_transcribe.go
+new file mode 100644
+index 0000000..8bf21cf
+--- /dev/null
++++ b/backend/internal/handler/openai_transcribe.go
+@@ -0,0 +1,105 @@
++package handler
++
++import (
++	"context"
++	"net/http"
++	"strconv"
++
++	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
++	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
++	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
++	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/gin-gonic/gin"
++	"go.uber.org/zap"
++)
++
++// CodexTranscribe is an opt-in private dictation relay. It must not silently
++// charge guessed audio seconds or treat a requested model as a verified one.
++func (h *OpenAIGatewayHandler) CodexTranscribe(c *gin.Context) {
++	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
++	if !ok || apiKey.Group == nil || apiKey.Group.Platform != service.PlatformOpenAI {
++		h.errorResponse(c, 403, "permission_error", "Codex transcription requires an OpenAI group")
++		return
++	}
++	if !apiKey.Group.AllowLive || apiKey.Group.AudioSTTPricePerHour == nil || *apiKey.Group.AudioSTTPricePerHour != 0 {
++		h.errorResponse(c, 403, "permission_error", "Enable Live and explicitly set STT price to zero for private Codex dictation; upstream usage is unreported")
++		return
++	}
++	subject, ok := middleware2.GetAuthSubjectFromContext(c)
++	if !ok {
++		h.errorResponse(c, 401, "authentication_error", "User context is required")
++		return
++	}
++	if !h.ensureResponsesDependencies(c, nil) {
++		return
++	}
++	body, err := pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
++	if err != nil {
++		h.errorResponse(c, 413, "invalid_request_error", "Cannot read audio upload")
++		return
++	}
++	input, err := service.ParseCodexTranscribeRequest(body, c.GetHeader("Content-Type"))
++	if err != nil {
++		h.errorResponse(c, 400, "invalid_request_error", err.Error())
++		return
++	}
++	if !apiKey.Group.ModelAllowlist.Allows(input.RequestedModel) {
++		h.errorResponse(c, 404, "not_found_error", "Requested model is not allowed in this group")
++		return
++	}
++	subscription, _ := middleware2.GetSubscriptionFromContext(c)
++	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
++		status, code, message, retry := billingErrorDetails(err)
++		if retry > 0 {
++			c.Header("Retry-After", strconv.Itoa(retry))
++		}
++		h.errorResponse(c, status, code, message)
++		return
++	}
++	userRelease, acquired, err := h.concurrencyHelper.TryAcquireUserSlot(c.Request.Context(), subject.UserID, subject.Concurrency)
++	if err != nil || !acquired {
++		h.errorResponse(c, 429, "rate_limit_error", "Transcription concurrency unavailable")
++		return
++	}
++	defer userRelease()
++	// No account rotation/retry after forwarding audio; a failed request must
++	// not quietly become a second subscription charge on another account.
++	selection, _, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
++		service.WithOpenAIProfitControlSuppressed(c.Request.Context()), apiKey.GroupID,
++		"", "", "", nil, service.OpenAIUpstreamTransportHTTPSSE,
++		service.OpenAIEndpointCapabilityTranscription, false, false, false, service.PlatformOpenAI)
++	if err != nil || selection == nil || selection.Account == nil || !selection.Acquired {
++		if selection != nil && selection.ReleaseFunc != nil {
++			selection.ReleaseFunc()
++		}
++		h.errorResponse(c, 503, "api_error", "No eligible Codex OAuth transcription account")
++		return
++	}
++	if selection.ReleaseFunc != nil {
++		defer selection.ReleaseFunc()
++	}
++	result, err := h.gatewayService.ForwardCodexTranscribe(c.Request.Context(), c, selection.Account, input)
++	if err != nil {
++		if !c.Writer.Written() {
++			h.errorResponse(c, http.StatusBadGateway, "upstream_error", "Codex transcription request failed")
++		}
++		return
++	}
++	if result == nil {
++		return
++	}
++	usage := &service.OpenAIRecordUsageInput{
++		Result: result, APIKey: apiKey, User: apiKey.User, Account: selection.Account,
++		Subscription: subscription, InboundEndpoint: GetInboundEndpoint(c), UpstreamEndpoint: input.UpstreamPath(),
++		UserAgent: c.GetHeader("User-Agent"), IPAddress: ip.GetClientIP(c),
++		RequestPayloadHash: service.HashUsageRequestPayload(body), APIKeyService: h.apiKeyService,
++		QuotaPlatform: service.QuotaPlatform(c.Request.Context(), apiKey),
++	}
++	h.submitMandatoryUsageRecordTask(c.Request.Context(), func(ctx context.Context) {
++		// submitMandatoryUsageRecordTask supplies the existing durable recorder.
++		if err := h.gatewayService.RecordUsage(ctx, usage); err != nil {
++			logger.L().Error("codex_transcribe.record_usage_failed", zap.Error(err), zap.Int64("api_key_id", apiKey.ID))
++		}
++	})
++}
+diff --git a/backend/internal/handler/openai_transcribe_test.go b/backend/internal/handler/openai_transcribe_test.go
+new file mode 100644
+index 0000000..4767ac2
+--- /dev/null
++++ b/backend/internal/handler/openai_transcribe_test.go
+@@ -0,0 +1,28 @@
++package handler
++
++import (
++	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/require"
++	"net/http/httptest"
++	"testing"
++)
++
++func TestCodexTranscribeRejectsGroupsWithoutExplicitPrivateVoiceConfiguration(t *testing.T) {
++	zero, nonzero := 0.0, 1.0
++	for _, group := range []*service.Group{
++		nil,
++		{Platform: service.PlatformGrok, AllowLive: true, AudioSTTPricePerHour: &zero},
++		{Platform: service.PlatformOpenAI, AudioSTTPricePerHour: &zero},
++		{Platform: service.PlatformOpenAI, AllowLive: true},
++		{Platform: service.PlatformOpenAI, AllowLive: true, AudioSTTPricePerHour: &nonzero},
++	} {
++		writer := httptest.NewRecorder()
++		c, _ := gin.CreateTestContext(writer)
++		c.Request = httptest.NewRequest("POST", "/v1/audio/transcriptions", nil)
++		c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{Group: group})
++		(&OpenAIGatewayHandler{}).CodexTranscribe(c)
++		require.Equal(t, 403, writer.Code)
++	}
++}
+diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
+index 86f6059..3fd9e42 100644
+--- a/backend/internal/server/routes/gateway.go
++++ b/backend/internal/server/routes/gateway.go
+@@ -213,6 +213,8 @@ func RegisterGatewayRoutes(
+ 		gateway.GET("/models/:model", h.Gateway.Models)
+ 		gateway.GET("/usage", h.Gateway.Usage)
+ 		gateway.POST("/live", h.OpenAIGateway.Live)
++		gateway.POST("/audio/transcriptions", h.OpenAIGateway.CodexTranscribe)
++		gateway.POST("/transcribe", h.OpenAIGateway.CodexTranscribe)
+ 		gateway.GET("/live/:call_id", h.OpenAIGateway.LiveSideband)
+ 		// OpenAI Responses API: auto-route based on group platform
+ 		gateway.POST("/responses", func(c *gin.Context) {
+@@ -386,6 +388,7 @@ func RegisterGatewayRoutes(
+ 	codexDirect.Use(bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), groupModelAllowlist, compositeTarget, requireGroupAnthropic)
+ 	{
+ 		codexDirect.POST("/realtime/calls", h.OpenAIGateway.Live)
++		codexDirect.POST("/transcribe", h.OpenAIGateway.CodexTranscribe)
+ 		codexDirect.GET("/:call_id", h.OpenAIGateway.LiveSideband)
+ 		codexDirect.POST("/responses", responsesHandler)
+ 		codexDirect.POST("/responses/*subpath", guardResponsesSubpath(responsesHandler))
+diff --git a/backend/internal/service/account.go b/backend/internal/service/account.go
+index 28dc287..bf7e73f 100644
+--- a/backend/internal/service/account.go
++++ b/backend/internal/service/account.go
+@@ -93,6 +93,7 @@ const (
+ 	OpenAIEndpointCapabilityEmbeddings      OpenAIEndpointCapability = "embeddings"
+ 	OpenAIEndpointCapabilityAlphaSearch     OpenAIEndpointCapability = "alpha_search"
+ 	OpenAIEndpointCapabilityLive            OpenAIEndpointCapability = "live"
++	OpenAIEndpointCapabilityTranscription   OpenAIEndpointCapability = "transcription"
+ 	// OpenAIEndpointCapabilityGrokMediaGeneration keeps image/video generation
+ 	// away from Grok accounts that are explicitly disabled or whose billing
+ 	// entitlement probe was forbidden. Video status lookups intentionally do not
+@@ -1856,7 +1857,7 @@ func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapa
+ 	}
+ 	switch capability {
+ 	case OpenAIEndpointCapabilityChatCompletions:
+-	case OpenAIEndpointCapabilityLive:
++	case OpenAIEndpointCapabilityLive, OpenAIEndpointCapabilityTranscription:
+ 		return a.Platform == PlatformOpenAI &&
+ 			a.Type == AccountTypeOAuth &&
+ 			!a.IsOpenAIPersonalAccessToken() &&
+diff --git a/backend/internal/service/openai_transcribe.go b/backend/internal/service/openai_transcribe.go
+new file mode 100644
+index 0000000..ee118a7
+--- /dev/null
++++ b/backend/internal/service/openai_transcribe.go
+@@ -0,0 +1,261 @@
++package service
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"mime"
++	"mime/multipart"
++	"net/http"
++	"strings"
++	"time"
++	"unicode/utf8"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
++	"github.com/gin-gonic/gin"
++	"github.com/google/uuid"
++	"go.uber.org/zap"
++)
++
++const chatGPTTranscribeURL = "https://chatgpt.com/backend-api/transcribe"
++const openAIAudioTranscriptionsURL = "https://api.openai.com/v1/audio/transcriptions"
++const codexAudioMaxBytes = 25 * 1024 * 1024
++
++// Codex's dictation endpoint chooses its model server-side unless it explicitly
++// reports otherwise. A requested model name is not proof of model identity.
++type CodexTranscribeRequest struct {
++	Body           []byte
++	ContentType    string
++	RequestedModel string
++}
++
++// Explicit transcription models use the public audio endpoint with the same
++// Codex OAuth bearer. The legacy server-selected dictation alias retains its
++// original endpoint; there is no retry or automatic endpoint fallback.
++func (r *CodexTranscribeRequest) UpstreamURL() string {
++	if r.RequestedModel == "codex-transcribe" {
++		return chatGPTTranscribeURL
++	}
++	return openAIAudioTranscriptionsURL
++}
++
++func (r *CodexTranscribeRequest) UpstreamPath() string {
++	if r.RequestedModel == "codex-transcribe" {
++		return "/backend-api/transcribe"
++	}
++	return "/v1/audio/transcriptions"
++}
++
++func ParseCodexTranscribeRequest(body []byte, contentType string) (*CodexTranscribeRequest, error) {
++	mediaType, params, err := mime.ParseMediaType(contentType)
++	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
++		return nil, errors.New("multipart/form-data with a boundary is required")
++	}
++	if len(body) > codexAudioMaxBytes+1024*1024 {
++		return nil, errors.New("audio upload exceeds 25 MiB")
++	}
++	reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
++	seen := make(map[string]bool)
++	arrayCounts := make(map[string]int)
++	model := "codex-transcribe"
++	for {
++		part, err := reader.NextPart()
++		if errors.Is(err, io.EOF) {
++			break
++		}
++		if err != nil {
++			return nil, errors.New("invalid multipart body")
++		}
++		name := part.FormName()
++		arrayField := name == "languages[]" || name == "keywords[]"
++		if seen[name] && !arrayField {
++			return nil, errors.New("duplicate multipart field")
++		}
++		seen[name] = true
++		switch name {
++		case "file":
++			if part.FileName() == "" {
++				return nil, errors.New("file must have a filename")
++			}
++			size, readErr := io.Copy(io.Discard, io.LimitReader(part, codexAudioMaxBytes+1))
++			if readErr != nil || size == 0 || size > codexAudioMaxBytes {
++				return nil, errors.New("invalid audio file size")
++			}
++		case "model", "language", "prompt", "response_format", "languages[]", "keywords[]":
++			limit := int64(4096)
++			if name == "prompt" {
++				limit = 4 * 65536
++			}
++			value, readErr := io.ReadAll(io.LimitReader(part, limit+1))
++			if readErr != nil || int64(len(value)) > limit || !utf8.Valid(value) {
++				return nil, errors.New("multipart field too large")
++			}
++			text := strings.TrimSpace(string(value))
++			if name == "prompt" && utf8.RuneCountInString(text) > 65536 {
++				return nil, errors.New("transcription prompt too large")
++			}
++			if arrayField {
++				arrayCounts[name]++
++				if name == "languages[]" && (arrayCounts[name] > 4 || len(text) == 0 || len(text) > 20) {
++					return nil, errors.New("invalid transcription language hints")
++				}
++				if name == "keywords[]" && (arrayCounts[name] > 992 || len(text) == 0 || utf8.RuneCountInString(text) > 80) {
++					return nil, errors.New("invalid transcription keywords")
++				}
++			}
++			if name == "response_format" && text != "json" {
++				return nil, errors.New("Codex dictation only exposes JSON transcripts")
++			}
++			if name == "model" {
++				switch text {
++				case "gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", "codex-transcribe":
++					model = text
++				default:
++					return nil, errors.New("unsupported requested transcription model")
++				}
++			}
++		default:
++			return nil, errors.New("unsupported multipart field")
++		}
++		_ = part.Close()
++	}
++	if !seen["file"] {
++		return nil, errors.New("audio file is required")
++	}
++	if model == "codex-transcribe" && len(arrayCounts) > 0 {
++		return nil, errors.New("structured hints require an explicit public transcription model")
++	}
++	if model == "codex-transcribe" && seen["model"] {
++		// This local selector means the server-selected Codex dictation model;
++		// it is not an upstream OpenAI model ID.
++		var normalized bytes.Buffer
++		writer := multipart.NewWriter(&normalized)
++		if err := writer.SetBoundary(params["boundary"]); err != nil {
++			return nil, err
++		}
++		reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
++		for {
++			part, err := reader.NextPart()
++			if errors.Is(err, io.EOF) {
++				break
++			}
++			if err != nil {
++				return nil, err
++			}
++			if part.FormName() == "model" {
++				_ = part.Close()
++				continue
++			}
++			out, err := writer.CreatePart(part.Header)
++			if err != nil {
++				return nil, err
++			}
++			if _, err := io.Copy(out, part); err != nil {
++				return nil, err
++			}
++		}
++		if err := writer.Close(); err != nil {
++			return nil, err
++		}
++		body = normalized.Bytes()
++	}
++	return &CodexTranscribeRequest{Body: body, ContentType: contentType, RequestedModel: model}, nil
++}
++
++func (s *OpenAIGatewayService) ForwardCodexTranscribe(ctx context.Context, c *gin.Context, account *Account, input *CodexTranscribeRequest) (*OpenAIForwardResult, error) {
++	if s == nil || c == nil || input == nil || account == nil || !account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityTranscription) {
++		return nil, errors.New("Codex transcription requires an OpenAI OAuth account")
++	}
++	token, _, err := s.GetAccessToken(ctx, account)
++	if err != nil {
++		return nil, err
++	}
++	// Do not detach from the caller or retry audio after a failed dispatch.
++	ctx = WithHTTPUpstreamRedirectsDisabled(WithHTTPUpstreamProfile(ctx, HTTPUpstreamProfileOpenAI))
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, input.UpstreamURL(), bytes.NewReader(input.Body))
++	if err != nil {
++		return nil, err
++	}
++	if input.RequestedModel == "codex-transcribe" {
++		headers, err := s.buildOpenAIAuthenticationHeaders(ctx, account, token)
++		if err != nil {
++			return nil, err
++		}
++		req.Header = headers
++		if err := resolveAndSetOpenAIChatGPTAccountHeaders(ctx, s.accountRepo, req.Header, account); err != nil {
++			return nil, err
++		}
++	} else {
++		req.Header.Set("Authorization", "Bearer "+token)
++	}
++	req.Header.Set("Content-Type", input.ContentType)
++	req.Header.Set("Accept", "application/json")
++	started := time.Now()
++	response, err := s.doOpenAIUpstream(req, resolveAccountProxyURL(account), account)
++	if err != nil {
++		return nil, err
++	}
++	defer response.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(response.Body, 2*1024*1024+1))
++	if err != nil || len(body) > 2*1024*1024 {
++		return nil, errors.New("invalid transcription response size")
++	}
++	if response.StatusCode >= 300 || response.StatusCode < 200 {
++		if retry := response.Header.Get("Retry-After"); retry != "" {
++			c.Header("Retry-After", retry)
++		}
++		status := response.StatusCode
++		if status < 400 {
++			status = http.StatusBadGateway
++		}
++		code := "upstream_rejected"
++		switch {
++		case strings.EqualFold(response.Header.Get("Cf-Mitigated"), "challenge"):
++			code = "upstream_challenge_required"
++		case response.StatusCode == http.StatusUnauthorized:
++			code = "upstream_authentication_failed"
++		case response.StatusCode == http.StatusForbidden:
++			code = "upstream_access_denied"
++		case response.StatusCode == http.StatusTooManyRequests:
++			code = "upstream_rate_limited"
++		}
++		logger.FromContext(ctx).Warn("codex_transcribe.upstream_rejected",
++			zap.Int("upstream_status", response.StatusCode), zap.String("error_code", code),
++			zap.String("content_type", truncateOpenAIWSLogValue(response.Header.Get("Content-Type"), 120)),
++			zap.String("request_id", truncateOpenAIWSLogValue(response.Header.Get("X-Request-Id"), 120)))
++		c.JSON(status, gin.H{"error": gin.H{"type": "upstream_error", "code": code,
++			"upstream_status": response.StatusCode, "message": "Codex transcription upstream rejected the request"}})
++		return nil, nil
++	}
++	var transcript struct {
++		Text  *string `json:"text"`
++		Model string  `json:"model"`
++	}
++	if err := json.Unmarshal(body, &transcript); err != nil || transcript.Text == nil {
++		return nil, errors.New("upstream did not return a transcript")
++	}
++	upstreamModel := strings.TrimSpace(transcript.Model)
++	if input.RequestedModel != "codex-transcribe" && upstreamModel != "" && upstreamModel != input.RequestedModel {
++		return nil, errors.New("transcription model mismatch")
++	}
++	if upstreamModel == "" {
++		c.Header("X-Sub2api-Transcription-Model", "upstream-selected")
++		c.Header("X-Sub2api-Model-Verification", "unreported")
++	} else {
++		c.Header("X-Sub2api-Transcription-Model", upstreamModel)
++		c.Header("X-Sub2api-Model-Verification", "upstream-reported")
++	}
++	if requestID := response.Header.Get("x-request-id"); requestID != "" {
++		c.Header("X-Request-Id", requestID)
++	}
++	c.Data(response.StatusCode, "application/json", body)
++	return &OpenAIForwardResult{
++		RequestID: "codex-transcribe-" + uuid.NewString(), Model: input.RequestedModel,
++		UpstreamModel: upstreamModel, Duration: time.Since(started), UpstreamHeaders: response.Header,
++		// The private endpoint supplies no reliable usage. The handler requires
++		// an explicitly zero-priced group; never invent token/duration charges.
++		AudioUsage: &AudioUsage{Mode: "stt", DurationOrUnits: 0},
++	}, nil
++}
+diff --git a/backend/internal/service/openai_transcribe_test.go b/backend/internal/service/openai_transcribe_test.go
+new file mode 100644
+index 0000000..3fa4bcf
+--- /dev/null
++++ b/backend/internal/service/openai_transcribe_test.go
+@@ -0,0 +1,206 @@
++package service
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"mime/multipart"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/Wei-Shaw/sub2api/internal/config"
++	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/require"
++)
++
++func transcriptionFixture(t *testing.T, fields ...string) ([]byte, string) {
++	t.Helper()
++	var body bytes.Buffer
++	w := multipart.NewWriter(&body)
++	part, err := w.CreateFormFile("file", "voice.wav")
++	require.NoError(t, err)
++	_, err = part.Write([]byte("RIFF-test-audio"))
++	require.NoError(t, err)
++	for i := 0; i < len(fields); i += 2 {
++		require.NoError(t, w.WriteField(fields[i], fields[i+1]))
++	}
++	require.NoError(t, w.Close())
++	return body.Bytes(), w.FormDataContentType()
++}
++
++func TestParseCodexTranscribePreservesAudioAndRequestedModel(t *testing.T) {
++	body, contentType := transcriptionFixture(t, "language", "zh", "model", "gpt-transcribe")
++	input, err := ParseCodexTranscribeRequest(body, contentType)
++	require.NoError(t, err)
++	require.Equal(t, "gpt-transcribe", input.RequestedModel)
++	require.Equal(t, body, input.Body)
++	plain, plainType := transcriptionFixture(t)
++	input, err = ParseCodexTranscribeRequest(plain, plainType)
++	require.NoError(t, err)
++	require.Equal(t, "codex-transcribe", input.RequestedModel)
++	alias, aliasType := transcriptionFixture(t, "model", "codex-transcribe")
++	input, err = ParseCodexTranscribeRequest(alias, aliasType)
++	require.NoError(t, err)
++	require.NotContains(t, string(input.Body), "codex-transcribe")
++	require.Contains(t, string(input.Body), "RIFF-test-audio")
++}
++
++func TestParseCodexTranscribeRejectsAmbiguousOrUnsupportedInput(t *testing.T) {
++	for _, fields := range [][]string{
++		{"model", "gpt-transcribe", "model", "gpt-4o-mini-transcribe"},
++		{"model", "invented-model"}, {"stream", "true"}, {"response_format", "text"},
++	} {
++		body, contentType := transcriptionFixture(t, fields...)
++		_, err := ParseCodexTranscribeRequest(body, contentType)
++		require.Error(t, err)
++	}
++	_, err := ParseCodexTranscribeRequest([]byte(`{}`), "application/json")
++	require.Error(t, err)
++	_, err = ParseCodexTranscribeRequest([]byte("bad"), "multipart/form-data; boundary=x")
++	require.Error(t, err)
++}
++
++type transcriptionHTTPStub struct {
++	liveHTTPUpstreamStub
++	status   int
++	response string
++	headers  http.Header
++	calls    int
++}
++
++func (s *transcriptionHTTPStub) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
++	s.calls++
++	s.request = req
++	s.body, _ = io.ReadAll(req.Body)
++	headers := s.headers
++	if headers == nil {
++		headers = http.Header{"Content-Type": {"application/json"}}
++	}
++	return &http.Response{StatusCode: s.status, Header: headers, Body: io.NopCloser(strings.NewReader(s.response))}, nil
++}
++func (s *transcriptionHTTPStub) DoWithTLS(req *http.Request, proxy string, id int64, concurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
++	return s.Do(req, proxy, id, concurrency)
++}
++
++func TestForwardCodexTranscribeUsesOAuthAndDoesNotInventModelIdentity(t *testing.T) {
++	for _, returnedModel := range []string{"", "gpt-transcribe"} {
++		stub := &transcriptionHTTPStub{status: 200, response: `{"text":"測試成功","model":"` + returnedModel + `"}`}
++		svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: stub}
++		account := &Account{ID: 7, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 2,
++			Credentials: map[string]any{"access_token": "private-token", "chatgpt_account_id": "acct_test"}}
++		body, contentType := transcriptionFixture(t, "model", "gpt-transcribe")
++		input, err := ParseCodexTranscribeRequest(body, contentType)
++		require.NoError(t, err)
++		writer := httptest.NewRecorder()
++		c, _ := gin.CreateTestContext(writer)
++		c.Request = httptest.NewRequest("POST", "/v1/audio/transcriptions", bytes.NewReader(body))
++		c.Request.Header.Set("Cookie", "private=member")
++		result, err := svc.ForwardCodexTranscribe(context.Background(), c, account, input)
++		require.NoError(t, err)
++		require.Equal(t, openAIAudioTranscriptionsURL, stub.request.URL.String())
++		require.Equal(t, "Bearer private-token", stub.request.Header.Get("Authorization"))
++		require.Empty(t, stub.request.Header.Get("Cookie"))
++		require.Empty(t, stub.request.Header.Get("ChatGPT-Account-Id"))
++		require.Empty(t, stub.request.Header.Get("Originator"))
++		require.Equal(t, body, stub.body)
++		require.Equal(t, "gpt-transcribe", result.Model)
++		require.Equal(t, returnedModel, result.UpstreamModel)
++		require.Zero(t, result.AudioUsage.DurationOrUnits)
++		if returnedModel == "" {
++			require.Equal(t, "unreported", writer.Header().Get("X-Sub2api-Model-Verification"))
++		}
++	}
++}
++
++func TestForwardCodexTranscribePublicEndpointRejectsModelMismatchWithoutRetry(t *testing.T) {
++	stub := &transcriptionHTTPStub{status: 200, response: `{"text":"hello","model":"gpt-4o-mini-transcribe"}`}
++	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: stub}
++	account := &Account{ID: 7, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
++		Credentials: map[string]any{"access_token": "private-token"}}
++	body, ct := transcriptionFixture(t, "model", "gpt-transcribe")
++	input, err := ParseCodexTranscribeRequest(body, ct)
++	require.NoError(t, err)
++	writer := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(writer)
++	c.Request = httptest.NewRequest("POST", "/v1/audio/transcriptions", nil)
++	result, err := svc.ForwardCodexTranscribe(context.Background(), c, account, input)
++	require.ErrorContains(t, err, "model mismatch")
++	require.Nil(t, result)
++	require.Equal(t, 1, stub.calls)
++	require.False(t, c.Writer.Written())
++}
++
++func TestCodexTranscribeEndpointChoiceIsExplicit(t *testing.T) {
++	for _, model := range []string{"gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"} {
++		input := &CodexTranscribeRequest{RequestedModel: model}
++		require.Equal(t, openAIAudioTranscriptionsURL, input.UpstreamURL())
++		require.Equal(t, "/v1/audio/transcriptions", input.UpstreamPath())
++	}
++	input := &CodexTranscribeRequest{RequestedModel: "codex-transcribe"}
++	require.Equal(t, chatGPTTranscribeURL, input.UpstreamURL())
++	require.Equal(t, "/backend-api/transcribe", input.UpstreamPath())
++}
++
++func TestParseCodexTranscribePublicHintsArePreservedAndBounded(t *testing.T) {
++	body, ct := transcriptionFixture(t, "model", "gpt-transcribe", "languages[]", "ja", "languages[]", "en", "keywords[]", "川流", "keywords[]", "Subruu", "prompt", strings.Repeat("context ", 1000))
++	input, err := ParseCodexTranscribeRequest(body, ct)
++	require.NoError(t, err)
++	require.Equal(t, body, input.Body)
++	for _, fields := range [][]string{
++		{"model", "codex-transcribe", "languages[]", "ja"},
++		{"model", "gpt-transcribe", "keywords[]", strings.Repeat("字", 81)},
++		{"model", "gpt-transcribe", "languages[]", "ja", "languages[]", "en", "languages[]", "zh", "languages[]", "ko", "languages[]", "fr"},
++	} {
++		b, contentType := transcriptionFixture(t, fields...)
++		_, err := ParseCodexTranscribeRequest(b, contentType)
++		require.Error(t, err)
++	}
++}
++
++func TestForwardCodexTranscribeDoesNotRetryOrLeakUpstreamErrors(t *testing.T) {
++	stub := &transcriptionHTTPStub{status: 403, response: `{"error":"private-token"}`}
++	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: stub}
++	account := &Account{ID: 7, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
++		Credentials: map[string]any{"access_token": "private-token", "chatgpt_account_id": "acct_test"}}
++	body, ct := transcriptionFixture(t)
++	input, err := ParseCodexTranscribeRequest(body, ct)
++	require.NoError(t, err)
++	writer := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(writer)
++	c.Request = httptest.NewRequest("POST", "/v1/transcribe", nil)
++	result, err := svc.ForwardCodexTranscribe(context.Background(), c, account, input)
++	require.NoError(t, err)
++	require.Nil(t, result)
++	require.Equal(t, 403, writer.Code)
++	require.Equal(t, 1, stub.calls)
++	require.NotContains(t, writer.Body.String(), "private-token")
++	require.Contains(t, writer.Body.String(), "upstream_access_denied")
++	account.Type = AccountTypeAPIKey
++	_, err = svc.ForwardCodexTranscribe(context.Background(), c, account, input)
++	require.Error(t, err)
++	require.Equal(t, 1, stub.calls)
++}
++
++func TestForwardCodexTranscribeReportsChallengeWithoutEchoingItsPage(t *testing.T) {
++	stub := &transcriptionHTTPStub{status: 403, response: "<html>private challenge body</html>",
++		headers: http.Header{"Content-Type": {"text/html"}, "Cf-Mitigated": {"challenge"}}}
++	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: stub}
++	account := &Account{ID: 7, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
++		Credentials: map[string]any{"access_token": "private-token", "chatgpt_account_id": "acct_test"}}
++	body, contentType := transcriptionFixture(t)
++	input, err := ParseCodexTranscribeRequest(body, contentType)
++	require.NoError(t, err)
++	writer := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(writer)
++	c.Request = httptest.NewRequest("POST", "/v1/audio/transcriptions", nil)
++	result, err := svc.ForwardCodexTranscribe(context.Background(), c, account, input)
++	require.NoError(t, err)
++	require.Nil(t, result)
++	require.Equal(t, 403, writer.Code)
++	require.Contains(t, writer.Body.String(), "upstream_challenge_required")
++	require.NotContains(t, writer.Body.String(), "private challenge body")
++	require.Equal(t, 1, stub.calls)
++}

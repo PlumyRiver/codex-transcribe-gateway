@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+data
+private
+upstream
+node_modules
+*.log
+*.wav
+*.mp3
+*.m4a
+*.webm
+*.enc
+*.zip
